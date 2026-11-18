@@ -1,11 +1,11 @@
-// Firebase web config. These values are public by design (they identify the
-// project, they don't grant access); access is enforced by firestore.rules and
-// storage.rules. Filled in after the Firebase project is created.
+// Firebase web config for the "production-management-console" project.
+// These values are public by design: they identify the project, they don't
+// grant access. Access is enforced by firestore.rules and storage.rules.
 export const firebaseConfig = {
-  apiKey: 'REPLACE_ME',
-  authDomain: 'REPLACE_ME.firebaseapp.com',
-  projectId: 'REPLACE_ME',
-  storageBucket: 'REPLACE_ME.firebasestorage.app',
-  messagingSenderId: 'REPLACE_ME',
-  appId: 'REPLACE_ME',
+  apiKey: 'AIzaSyAQsGy8TXH-ur4pQ9A2IjxguROqeVgfa_c',
+  authDomain: 'production-management-console.firebaseapp.com',
+  projectId: 'production-management-console',
+  storageBucket: 'production-management-console.firebasestorage.app',
+  messagingSenderId: '9001037663',
+  appId: '1:9001037663:web:1111677657384d800790ea',
 };
