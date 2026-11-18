@@ -590,9 +590,9 @@ function membersView() {
     .join('');
   return `
     <section class="page">
-      <div class="page-head"><h1>Members</h1><p>Only these Google accounts can sign in. Admins manage releases, release notes and members; developers add and edit their own PRs.</p></div>
+      <div class="page-head"><h1>Members</h1><p>Only these accounts can sign in, with Google or with a company Microsoft account (@digitalpetro.ai). Admins manage releases, release notes and members; developers add and edit their own PRs.</p></div>
       <form class="card add-member" data-form="add-member">
-        <label class="grow">Google account email<input name="email" id="m-email" type="email" required autocomplete="off" placeholder="name@company.com" /></label>
+        <label class="grow">Email (Google or @digitalpetro.ai)<input name="email" id="m-email" type="email" required autocomplete="off" placeholder="name@company.com" /></label>
         <label>Name<input name="name" id="m-name" maxlength="80" placeholder="Optional" /></label>
         <label>Role<select name="role" id="m-role"><option value="dev">dev</option><option value="admin">admin</option></select></label>
         <button class="primary" ${state.busy ? 'disabled' : ''}>Add member</button>
