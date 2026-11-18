@@ -5,6 +5,7 @@ const base = 'http://127.0.0.1:8180/v1/projects/demo-release-board/databases/(de
 const members = [
   ['admin@example.com', 'admin', 'Test Admin'],
   ['dev@example.com', 'dev', 'Test Dev'],
+  ['ms.dev@digitalpetro.ai', 'dev', 'Microsoft Dev'],
 ];
 for (const [email, role, name] of members) {
   const res = await fetch(`${base}/members/${encodeURIComponent(email)}`, {

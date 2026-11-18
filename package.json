@@ -8,7 +8,7 @@
     "seed:emu": "node scripts/seed-emulator.mjs",
     "build": "vite build",
     "preview": "vite preview",
-    "test:rules": "firebase emulators:exec --project demo-release-board --only firestore,storage \"vitest run tests/rules.test.js\""
+    "test:rules": "firebase emulators:exec --project demo-release-board --only firestore \"vitest run tests/rules.test.js\""
   },
   "license": "UNLICENSED",
   "description": "Production release board: PR links and release notes per release",

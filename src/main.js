@@ -1,8 +1,9 @@
 import './style.css';
-import { auth, db, storage, googleProvider, usingEmulators } from './firebase.js';
-import { GoogleAuthProvider, onAuthStateChanged, signInWithCredential, signInWithPopup, signOut } from 'firebase/auth';
+import { auth, db, googleProvider, microsoftProvider, usingEmulators } from './firebase.js';
+import { GoogleAuthProvider, OAuthProvider, onAuthStateChanged, signInWithCredential, signInWithPopup, signOut } from 'firebase/auth';
 import {
   addDoc,
+  Bytes,
   collection,
   collectionGroup,
   deleteDoc,
@@ -15,13 +16,12 @@ import {
   updateDoc,
   writeBatch,
 } from 'firebase/firestore';
-import { deleteObject, getBlob, ref, uploadBytes } from 'firebase/storage';
 
 const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
-const MAX_DOCX = 10 * 1024 * 1024;
+const MAX_DOCX = 5 * 1024 * 1024; // must match firestore.rules
+const CHUNK_BYTES = 900 * 1024; // Firestore documents max out at 1 MiB
 const VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/;
 const STATUSES = { planned: 'Planned', qa: 'In QA', released: 'Released' };
-const notesPath = (releaseId) => `release-notes/${releaseId}/notes.docx`;
 
 const app = document.getElementById('app');
 
@@ -72,6 +72,9 @@ const friendlyError = (e) => {
   if (code.includes('permission-denied') || code.includes('unauthorized')) return "You don't have permission to do that.";
   if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') return null;
   if (code === 'auth/unauthorized-domain') return 'This site is not an authorised domain for sign-in yet.';
+  if (code === 'auth/account-exists-with-different-credential')
+    return 'This email already signs in with the other button (Google or Microsoft). Please use that one.';
+  if (code === 'auth/operation-not-allowed') return 'That sign-in method is not switched on yet.';
   return e?.message || String(e);
 };
 
@@ -243,18 +246,31 @@ async function deleteRelease(release) {
   const n = entriesFor(release.id).length;
   if (!confirm(`Delete release ${release.version}, its ${n} PR entr${n === 1 ? 'y' : 'ies'} and its release notes? This can't be undone.`)) return;
   await run('delete-release', async () => {
-    const entrySnap = await getDocs(collection(db, 'releases', release.id, 'entries'));
+    const [entrySnap, chunkSnap] = await Promise.all([
+      getDocs(collection(db, 'releases', release.id, 'entries')),
+      getDocs(collection(db, 'releases', release.id, 'noteChunks')),
+    ]);
     const batch = writeBatch(db);
     entrySnap.forEach((d) => batch.delete(d.ref));
+    chunkSnap.forEach((d) => batch.delete(d.ref));
     batch.delete(doc(db, 'releases', release.id));
-    if (release.notes) {
-      await deleteObject(ref(storage, notesPath(release.id))).catch((e) => {
-        if (e.code !== 'storage/object-not-found') throw e;
-      });
-    }
     await batch.commit();
     location.hash = '#/';
   }, `Release ${release.version} deleted.`);
+}
+
+// Release notes live in Firestore (free Spark plan, no Cloud Storage): the .docx
+// bytes are split into chunks at releases/{id}/noteChunks/{uploadId}_{n}, and
+// release.notes records the upload id and chunk count. A replacement writes a
+// new upload id first, then switches release.notes, then deletes the old chunks,
+// so a failed upload never breaks the notes already attached.
+const chunkRef = (releaseId, uploadId, i) => doc(db, 'releases', releaseId, 'noteChunks', `${uploadId}_${i}`);
+
+async function deleteChunks(releaseId, notes) {
+  if (!notes?.uploadId) return;
+  await Promise.all(
+    Array.from({ length: notes.chunks || 0 }, (_, i) => deleteDoc(chunkRef(releaseId, notes.uploadId, i)).catch(() => {})),
+  );
 }
 
 async function uploadNotes(release, file) {
@@ -263,36 +279,59 @@ async function uploadNotes(release, file) {
     flash('error', 'Release notes must be a .docx file.');
     return;
   }
-  if (file.size > MAX_DOCX) {
-    flash('error', `That file is ${fmtSize(file.size)}; the limit is 10 MB.`);
+  if (file.size === 0 || file.size > MAX_DOCX) {
+    flash('error', file.size ? `That file is over the ${MAX_DOCX / 1024 / 1024} MB limit (${(file.size / 1024 / 1024).toFixed(2)} MB).` : 'That file is empty.');
     return;
   }
   if (release.notes && !confirm(`Replace ${release.notes.name} with ${file.name}?`)) return;
   await run('upload', async () => {
-    await uploadBytes(ref(storage, notesPath(release.id)), file, {
-      contentType: DOCX_TYPE,
-      customMetadata: { originalName: file.name },
-    });
-    await updateDoc(doc(db, 'releases', release.id), {
-      notes: {
-        path: notesPath(release.id),
-        name: file.name.slice(0, 200),
-        size: file.size,
-        uploadedBy: myEmail(),
-        uploadedAt: serverTimestamp(),
-      },
-      updatedAt: serverTimestamp(),
-    });
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const uploadId = crypto.getRandomValues(new Uint32Array(3)).reduce((s, n) => s + n.toString(36).padStart(7, '0'), '');
+    const chunks = Math.ceil(bytes.length / CHUNK_BYTES);
+    const fresh = { uploadId, chunks };
+    try {
+      for (let i = 0; i < chunks; i++) {
+        state.busy = `upload:${i + 1}/${chunks}`;
+        render();
+        await setDoc(chunkRef(release.id, uploadId, i), {
+          data: Bytes.fromUint8Array(bytes.subarray(i * CHUNK_BYTES, (i + 1) * CHUNK_BYTES)),
+        });
+      }
+      await updateDoc(doc(db, 'releases', release.id), {
+        notes: {
+          uploadId,
+          chunks,
+          name: file.name.slice(0, 200),
+          size: bytes.length,
+          uploadedBy: myEmail(),
+          uploadedAt: serverTimestamp(),
+        },
+        updatedAt: serverTimestamp(),
+      });
+    } catch (e) {
+      await deleteChunks(release.id, fresh);
+      throw e;
+    }
+    await deleteChunks(release.id, release.notes);
   }, 'Release notes uploaded.');
 }
 
 async function downloadNotes(release) {
+  const notes = release.notes;
   await run('download', async () => {
-    const blob = await getBlob(ref(storage, notesPath(release.id)));
-    const url = URL.createObjectURL(new Blob([blob], { type: DOCX_TYPE }));
+    const parts = await Promise.all(
+      Array.from({ length: notes.chunks }, async (_, i) => {
+        const snap = await getDoc(chunkRef(release.id, notes.uploadId, i));
+        if (!snap.exists()) throw new Error('Part of this file is missing; ask an admin to upload it again.');
+        return snap.data().data.toUint8Array();
+      }),
+    );
+    const blob = new Blob(parts, { type: DOCX_TYPE });
+    if (blob.size !== notes.size) throw new Error('The downloaded file is incomplete; please try again.');
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = release.notes?.name || `${release.version}-release-notes.docx`;
+    a.download = notes.name || `${release.version}-release-notes.docx`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -302,11 +341,10 @@ async function downloadNotes(release) {
 
 async function removeNotes(release) {
   if (!confirm(`Remove ${release.notes.name} from ${release.version}?`)) return;
+  const old = release.notes;
   await run('remove-notes', async () => {
-    await deleteObject(ref(storage, notesPath(release.id))).catch((e) => {
-      if (e.code !== 'storage/object-not-found') throw e;
-    });
     await updateDoc(doc(db, 'releases', release.id), { notes: null, updatedAt: serverTimestamp() });
+    await deleteChunks(release.id, old);
   }, 'Release notes removed.');
 }
 
@@ -488,10 +526,10 @@ function releaseView(id) {
     : `<p class="muted">No release notes attached yet.</p>`;
   const notesAdmin = admin
     ? `<div class="notes-admin">
-        <label class="file-btn ${state.busy ? 'disabled' : ''}">${state.busy === 'upload' ? 'Uploading…' : r.notes ? 'Replace .docx' : 'Upload .docx'}
+        <label class="file-btn ${state.busy ? 'disabled' : ''}">${state.busy.startsWith('upload') ? `Uploading ${state.busy.slice(7)}…` : r.notes ? 'Replace .docx' : 'Upload .docx'}
           <input type="file" data-act="upload" accept=".docx,${DOCX_TYPE}" ${state.busy ? 'disabled' : ''} /></label>
         ${r.notes ? '<button class="link danger" data-act="remove-notes">Remove</button>' : ''}
-        <small class="muted">.docx only, up to 10 MB.</small>
+        <small class="muted">.docx only, up to 5 MB.</small>
       </div>`
     : '';
 
@@ -572,10 +610,14 @@ function signedOutView() {
         <span class="logo big" aria-hidden="true"></span>
         <h1>Release Board</h1>
         <p>Production releases, the PRs that go into them, and their release notes.</p>
-        <button class="primary google" data-act="sign-in">Sign in with Google</button>
+        <div class="signin-buttons">
+          <button class="primary google" data-act="sign-in">Sign in with Google</button>
+          <button class="ghost microsoft" data-act="sign-in-ms"><span class="ms-logo" aria-hidden="true"></span>Sign in with Microsoft</button>
+        </div>
+        <p class="muted small">Use your company Microsoft account (@digitalpetro.ai) or Google. An admin has to add your email first.</p>
         ${usingEmulators ? `<form class="emu-signin" data-form="emu-sign-in">
           <p class="muted small">Local emulator mode: sign in as a fake Google account</p>
-          <div class="row"><input name="email" id="emu-email" type="email" value="admin@example.com" /><button class="ghost">Go</button></div>
+          <div class="row"><input name="email" id="emu-email" type="email" value="admin@example.com" /><select name="provider" id="emu-provider"><option value="google.com">Google</option><option value="microsoft.com">Microsoft</option></select><button class="ghost">Go</button></div>
         </form>` : ''}
       </div>
     </main>`;
@@ -640,6 +682,9 @@ app.addEventListener('click', (ev) => {
   switch (act) {
     case 'sign-in':
       signInWithPopup(auth, googleProvider).catch((e) => flash('error', friendlyError(e)));
+      break;
+    case 'sign-in-ms':
+      signInWithPopup(auth, microsoftProvider).catch((e) => flash('error', friendlyError(e)));
       break;
     case 'sign-out':
       signOut(auth);
@@ -710,9 +755,10 @@ app.addEventListener('submit', (ev) => {
       // Emulator only: the Auth emulator accepts unsigned Google ID tokens.
       if (usingEmulators) {
         const email = form.email.value.trim();
-        const cred = GoogleAuthProvider.credential(
-          JSON.stringify({ sub: `emu-${email}`, email, email_verified: true, name: email.split('@')[0] }),
-        );
+        const ms = form.provider.value === 'microsoft.com';
+        // Microsoft tokens often arrive without email_verified; mimic that here.
+        const token = JSON.stringify({ sub: `emu-${ms ? 'ms' : 'g'}-${email}`, email, email_verified: !ms, name: email.split('@')[0] });
+        const cred = ms ? new OAuthProvider('microsoft.com').credential({ idToken: token }) : GoogleAuthProvider.credential(token);
         signInWithCredential(auth, cred).catch((e) => flash('error', friendlyError(e)));
       }
       break;

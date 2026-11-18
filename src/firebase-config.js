@@ -9,3 +9,7 @@ export const firebaseConfig = {
   messagingSenderId: '9001037663',
   appId: '1:9001037663:web:1111677657384d800790ea',
 };
+
+// Microsoft Entra ID tenant (directory) ID of the company tenant. Not a secret.
+// Filled in after the Entra app registration is created.
+export const microsoftTenantId = 'REPLACE_ME';

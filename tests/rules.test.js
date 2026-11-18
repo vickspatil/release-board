@@ -1,5 +1,5 @@
-// Security-rules tests. Run with `npm run test:rules` (starts the Firestore,
-// Storage and Auth emulators, then runs this file with vitest).
+// Security-rules tests. Run with `npm run test:rules` (starts the Firestore
+// emulator, then runs this file with vitest).
 import { readFileSync } from 'node:fs';
 import { afterAll, beforeAll, beforeEach, describe, test } from 'vitest';
 import {
@@ -10,7 +10,6 @@ import {
 import firebase from 'firebase/compat/app';
 
 const PROJECT = 'demo-release-board';
-const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 const ts = () => firebase.firestore.FieldValue.serverTimestamp();
 
 const ADMIN = { uid: 'u-admin', email: 'admin@example.com' };
@@ -23,7 +22,6 @@ let env;
 const as = (u, extra = {}) =>
   env.authenticatedContext(u.uid, { email: u.email, email_verified: true, ...extra });
 const db = (u, extra) => as(u, extra).firestore();
-const bucket = (u) => as(u).storage();
 
 const release = (uid, over = {}) => ({
   version: 'v1.0.0',
@@ -50,14 +48,12 @@ beforeAll(async () => {
   env = await initializeTestEnvironment({
     projectId: PROJECT,
     firestore: { rules: readFileSync('firestore.rules', 'utf8') },
-    storage: { rules: readFileSync('storage.rules', 'utf8') },
   });
 });
 afterAll(() => env?.cleanup());
 
 beforeEach(async () => {
   await env.clearFirestore();
-  await env.clearStorage();
   await env.withSecurityRulesDisabled(async (ctx) => {
     const f = ctx.firestore();
     const now = firebase.firestore.Timestamp.now();
@@ -165,10 +161,12 @@ describe('releases', () => {
   test('admin edits status/date and attaches notes metadata', async () => {
     const f = db(ADMIN);
     await assertSucceeds(f.doc('releases/v1.0.0').update({ status: 'released', releaseDate: '2026-12-05', updatedAt: ts() }));
-    const notes = { path: 'release-notes/v1.0.0/notes.docx', name: 'Release v1.docx', size: 1234, uploadedBy: ADMIN.email, uploadedAt: ts() };
+    const notes = { uploadId: 'abc12345xyz', chunks: 2, name: 'Release v1.docx', size: 1234, uploadedBy: ADMIN.email, uploadedAt: ts() };
     await assertSucceeds(f.doc('releases/v1.0.0').update({ notes, updatedAt: ts() }));
-    await assertFails(f.doc('releases/v1.0.0').update({ notes: { ...notes, path: 'elsewhere/x.docx' }, updatedAt: ts() }));
     await assertFails(f.doc('releases/v1.0.0').update({ notes: { ...notes, name: 'evil.exe' }, updatedAt: ts() }));
+    await assertFails(f.doc('releases/v1.0.0').update({ notes: { ...notes, size: 5 * 1024 * 1024 + 1 }, updatedAt: ts() }));
+    await assertFails(f.doc('releases/v1.0.0').update({ notes: { ...notes, chunks: 7 }, updatedAt: ts() }));
+    await assertFails(f.doc('releases/v1.0.0').update({ notes: { ...notes, uploadId: '../x' }, updatedAt: ts() }));
   });
 
   test('devs cannot create, edit or delete releases', async () => {
@@ -227,41 +225,73 @@ describe('PR entries', () => {
   });
 });
 
-describe('release-notes storage', () => {
-  const path = 'release-notes/v1.0.0/notes.docx';
-  const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3]);
+describe('release-notes chunks (Firestore)', () => {
+  const chunks = 'releases/v1.0.0/noteChunks';
+  const blob = (n) => firebase.firestore.Blob.fromUint8Array(new Uint8Array(n).fill(7));
 
-  test('admin uploads and replaces a .docx; members download it', async () => {
-    await assertSucceeds(bucket(ADMIN).ref(path).put(bytes, { contentType: DOCX }));
-    await assertSucceeds(bucket(ADMIN).ref(path).put(bytes, { contentType: DOCX }));
-    await assertSucceeds(bucket(DEV).ref(path).getMetadata());
+  test('admin writes chunks; members read them', async () => {
+    await assertSucceeds(db(ADMIN).doc(`${chunks}/abc12345xyz_0`).set({ data: blob(900 * 1024) }));
+    await assertSucceeds(db(DEV).doc(`${chunks}/abc12345xyz_0`).get());
+    await assertSucceeds(db(DEV).collection(chunks).get());
   });
 
-  test('strangers and signed-out users cannot download', async () => {
-    await env.withSecurityRulesDisabled((ctx) => ctx.storage().ref(path).put(bytes, { contentType: DOCX }));
-    await assertFails(bucket(STRANGER).ref(path).getMetadata());
-    await assertFails(env.unauthenticatedContext().storage().ref(path).getMetadata());
+  test('strangers cannot read chunks', async () => {
+    await env.withSecurityRulesDisabled((ctx) => ctx.firestore().doc(`${chunks}/abc12345xyz_0`).set({ data: blob(10) }));
+    await assertFails(db(STRANGER).doc(`${chunks}/abc12345xyz_0`).get());
+    await assertFails(env.unauthenticatedContext().firestore().doc(`${chunks}/abc12345xyz_0`).get());
   });
 
-  test('devs cannot upload or delete notes', async () => {
-    await assertFails(bucket(DEV).ref(path).put(bytes, { contentType: DOCX }));
-    await env.withSecurityRulesDisabled((ctx) => ctx.storage().ref(path).put(bytes, { contentType: DOCX }));
-    await assertFails(bucket(DEV).ref(path).delete());
+  test('devs cannot write or delete chunks', async () => {
+    await assertFails(db(DEV).doc(`${chunks}/abc12345xyz_0`).set({ data: blob(10) }));
+    await env.withSecurityRulesDisabled((ctx) => ctx.firestore().doc(`${chunks}/abc12345xyz_0`).set({ data: blob(10) }));
+    await assertFails(db(DEV).doc(`${chunks}/abc12345xyz_0`).delete());
   });
 
-  test('only .docx content type, under 10 MB, for an existing release', async () => {
-    await assertFails(bucket(ADMIN).ref(path).put(bytes, { contentType: 'application/pdf' }));
-    await assertFails(bucket(ADMIN).ref(path).put(new Uint8Array(10 * 1024 * 1024 + 1), { contentType: DOCX }));
-    await assertFails(bucket(ADMIN).ref('release-notes/nope/notes.docx').put(bytes, { contentType: DOCX }));
+  test('chunks are write-once, bytes only, at most 900 KiB, ids _0.._5', async () => {
+    const f = db(ADMIN);
+    await assertSucceeds(f.doc(`${chunks}/abc12345xyz_0`).set({ data: blob(10) }));
+    await assertFails(f.doc(`${chunks}/abc12345xyz_0`).set({ data: blob(20) }));
+    await assertFails(f.doc(`${chunks}/abc12345xyz_1`).set({ data: blob(900 * 1024 + 1) }));
+    await assertFails(f.doc(`${chunks}/abc12345xyz_1`).set({ data: 'not bytes' }));
+    await assertFails(f.doc(`${chunks}/abc12345xyz_1`).set({ data: blob(10), extra: 1 }));
+    await assertFails(f.doc(`${chunks}/abc12345xyz_6`).set({ data: blob(10) }));
+    await assertFails(f.doc(`${chunks}/BAD-ID_0`).set({ data: blob(10) }));
+    await assertFails(f.doc('releases/nope/noteChunks/abc12345xyz_0').set({ data: blob(10) }));
   });
 
-  test('no other paths are writable', async () => {
-    await assertFails(bucket(ADMIN).ref('release-notes/v1.0.0/other.docx').put(bytes, { contentType: DOCX }));
-    await assertFails(bucket(ADMIN).ref('anything.txt').put(bytes, { contentType: 'text/plain' }));
+  test('admin deletes chunks', async () => {
+    await env.withSecurityRulesDisabled((ctx) => ctx.firestore().doc(`${chunks}/abc12345xyz_0`).set({ data: blob(10) }));
+    await assertSucceeds(db(ADMIN).doc(`${chunks}/abc12345xyz_0`).delete());
+  });
+});
+
+describe('Microsoft sign-in', () => {
+  const ms = (email, verified = false) =>
+    env.authenticatedContext('u-ms', { email, email_verified: verified, firebase: { sign_in_provider: 'microsoft.com' } }).firestore();
+
+  beforeEach(() =>
+    env.withSecurityRulesDisabled((ctx) =>
+      ctx.firestore().doc('members/asha@digitalpetro.ai').set({ role: 'dev', name: 'Asha', addedBy: 'seed', addedAt: firebase.firestore.Timestamp.now() }),
+    ),
+  );
+
+  test('allowlisted company account gets in without email_verified', async () => {
+    await assertSucceeds(ms('asha@digitalpetro.ai').collection('releases').get());
+    await assertSucceeds(ms('Asha@DigitalPetro.ai').collection('releases').get());
   });
 
-  test('admin deletes notes', async () => {
-    await env.withSecurityRulesDisabled((ctx) => ctx.storage().ref(path).put(bytes, { contentType: DOCX }));
-    await assertSucceeds(bucket(ADMIN).ref(path).delete());
+  test('company account not on the allowlist is refused', async () => {
+    await assertFails(ms('ravi@digitalpetro.ai').collection('releases').get());
+    await assertSucceeds(ms('ravi@digitalpetro.ai').doc('members/ravi@digitalpetro.ai').get());
+  });
+
+  test('unverified non-company email via Microsoft is refused even if allowlisted', async () => {
+    await assertFails(ms('dev@example.com').collection('releases').get());
+    await assertFails(ms('asha@digitalpetro.ai.evil.com').collection('releases').get());
+  });
+
+  test('unverified email from other providers is still refused', async () => {
+    const f = env.authenticatedContext('u-x', { email: 'asha@digitalpetro.ai', email_verified: false, firebase: { sign_in_provider: 'password' } }).firestore();
+    await assertFails(f.collection('releases').get());
   });
 });

@@ -9,13 +9,20 @@ rules_version = '2';
 //     releases and attach the release-notes .docx.
 //   - Any member may add PR entries under a release; only the entry's owner or
 //     an admin may edit or delete it.
+//   - Sign-in: Google (verified email) or Microsoft from the company Entra
+//     tenant. Microsoft tokens may lack email_verified, so they are accepted
+//     only for @digitalpetro.ai addresses (the Entra app is single-tenant).
+//   - Release notes (.docx, max 5 MB) are stored in Firestore as chunks under
+//     releases/{id}/noteChunks, because the project stays on the free plan.
 service cloud.firestore {
   match /databases/{database}/documents {
 
     function signedIn() {
       return request.auth != null
         && request.auth.token.email is string
-        && request.auth.token.email_verified == true;
+        && (request.auth.token.email_verified == true
+            || (request.auth.token.firebase.sign_in_provider == 'microsoft.com'
+                && request.auth.token.email.lower().matches('^[^@]+@digitalpetro[.]ai$')));
     }
     function myEmail() { return request.auth.token.email.lower(); }
     function memberPath() {
@@ -61,13 +68,15 @@ service cloud.firestore {
     }
 
     // ---- releases -----------------------------------------------------------
-    function validNotes(n, releaseId) {
+    // 5 MB max, stored as chunks of at most 900 KiB (so at most 6 chunks).
+    function validNotes(n) {
       return n is map
-        && n.keys().hasOnly(['path', 'name', 'size', 'uploadedBy', 'uploadedAt'])
-        && n.keys().hasAll(['path', 'name', 'size', 'uploadedBy', 'uploadedAt'])
-        && n.path == 'release-notes/' + releaseId + '/notes.docx'
+        && n.keys().hasOnly(['uploadId', 'chunks', 'name', 'size', 'uploadedBy', 'uploadedAt'])
+        && n.keys().hasAll(['uploadId', 'chunks', 'name', 'size', 'uploadedBy', 'uploadedAt'])
+        && n.uploadId is string && n.uploadId.matches('^[a-z0-9]{8,40}$')
+        && n.chunks is int && n.chunks >= 1 && n.chunks <= 6
         && str(n.name, 1, 200) && n.name.lower().matches('.*[.]docx$')
-        && n.size is int && n.size > 0 && n.size <= 10485760
+        && n.size is int && n.size > 0 && n.size <= 5242880
         && n.uploadedBy is string
         && n.uploadedAt is timestamp;
     }
@@ -81,7 +90,7 @@ service cloud.firestore {
         && d.status in ['planned', 'qa', 'released']
         && d.releaseDate is string
         && (d.releaseDate == '' || d.releaseDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))
-        && (d.notes == null || validNotes(d.notes, releaseId))
+        && (d.notes == null || validNotes(d.notes))
         && d.updatedAt == request.time;
     }
 
@@ -105,6 +114,20 @@ service cloud.firestore {
           && d.updatedAt == request.time;
       }
       function ownsEntry() { return resource.data.ownerUid == request.auth.uid; }
+
+      // ---- release-notes chunks ----------------------------------------------
+      // Write-once pieces of the .docx; admins create and delete, members read.
+      match /noteChunks/{chunkId} {
+        allow read: if isMember();
+        allow create: if isAdmin()
+          && chunkId.matches('^[a-z0-9]{8,40}_[0-5]$')
+          && request.resource.data.keys().hasOnly(['data'])
+          && request.resource.data.data is bytes
+          && request.resource.data.data.size() > 0
+          && request.resource.data.data.size() <= 921600
+          && exists(/databases/$(database)/documents/releases/$(releaseId));
+        allow delete: if isAdmin();
+      }
 
       match /entries/{entryId} {
         allow read: if isMember();
