@@ -1,0 +1,127 @@
+rules_version = '2';
+
+// Release Board: Firestore security rules.
+//
+// Access model
+//   - Only Google accounts whose (lower-cased) email has a document in /members
+//     may read or write anything. The allowlist lives in Firestore, not in code.
+//   - members/{email}.role == 'admin' may manage members, create/edit/delete
+//     releases and attach the release-notes .docx.
+//   - Any member may add PR entries under a release; only the entry's owner or
+//     an admin may edit or delete it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+    function myEmail() { return request.auth.token.email.lower(); }
+    function memberPath() {
+      return /databases/$(database)/documents/members/$(myEmail());
+    }
+    function isMember() { return signedIn() && exists(memberPath()); }
+    function isAdmin() { return isMember() && get(memberPath()).data.role == 'admin'; }
+
+    function str(v, min, max) {
+      return v is string && v.size() >= min && v.size() <= max;
+    }
+    function unchanged(field) {
+      return request.resource.data[field] == resource.data[field];
+    }
+
+    // ---- members (the allowlist) -------------------------------------------
+    function validMember(email) {
+      let d = request.resource.data;
+      return email == email.lower()
+        && email.matches('^[^@ ]+@[^@ ]+[.][^@ ]+$')
+        && d.keys().hasOnly(['role', 'name', 'addedBy', 'addedAt'])
+        && d.keys().hasAll(['role', 'name', 'addedBy', 'addedAt'])
+        && d.role in ['admin', 'dev']
+        && str(d.name, 0, 80)
+        && d.addedBy is string
+        && d.addedAt is timestamp;
+    }
+
+    match /members/{email} {
+      // Anyone signed in may check their own entry (so the app can say
+      // "you are not on the allowlist"); members may list everyone.
+      allow get: if signedIn() && email == myEmail();
+      allow read: if isMember();
+      allow create: if isAdmin() && validMember(email)
+        && request.resource.data.addedBy == myEmail()
+        && request.resource.data.addedAt == request.time;
+      // Admins can't demote themselves (avoids locking the last admin out).
+      allow update: if isAdmin() && validMember(email)
+        && unchanged('addedBy') && unchanged('addedAt')
+        && (email != myEmail() || request.resource.data.role == 'admin');
+      // Admins can't remove themselves.
+      allow delete: if isAdmin() && email != myEmail();
+    }
+
+    // ---- releases -----------------------------------------------------------
+    function validNotes(n, releaseId) {
+      return n is map
+        && n.keys().hasOnly(['path', 'name', 'size', 'uploadedBy', 'uploadedAt'])
+        && n.keys().hasAll(['path', 'name', 'size', 'uploadedBy', 'uploadedAt'])
+        && n.path == 'release-notes/' + releaseId + '/notes.docx'
+        && str(n.name, 1, 200) && n.name.lower().matches('.*[.]docx$')
+        && n.size is int && n.size > 0 && n.size <= 10485760
+        && n.uploadedBy is string
+        && n.uploadedAt is timestamp;
+    }
+
+    function validRelease(releaseId) {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['version', 'status', 'releaseDate', 'notes', 'createdBy', 'createdAt', 'updatedAt'])
+        && d.keys().hasAll(['version', 'status', 'releaseDate', 'notes', 'createdBy', 'createdAt', 'updatedAt'])
+        && releaseId.matches('^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$')
+        && d.version == releaseId
+        && d.status in ['planned', 'qa', 'released']
+        && d.releaseDate is string
+        && (d.releaseDate == '' || d.releaseDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'))
+        && (d.notes == null || validNotes(d.notes, releaseId))
+        && d.updatedAt == request.time;
+    }
+
+    match /releases/{releaseId} {
+      allow read: if isMember();
+      allow create: if isAdmin() && validRelease(releaseId)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin() && validRelease(releaseId)
+        && unchanged('createdBy') && unchanged('createdAt');
+      allow delete: if isAdmin();
+
+      // ---- PR entries -------------------------------------------------------
+      function validEntry() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['devName', 'prUrl', 'summary', 'ownerUid', 'ownerEmail', 'createdAt', 'updatedAt'])
+          && d.keys().hasAll(['devName', 'prUrl', 'summary', 'ownerUid', 'ownerEmail', 'createdAt', 'updatedAt'])
+          && str(d.devName, 1, 80)
+          && str(d.prUrl, 10, 500) && d.prUrl.matches('^https?://[^ ]+$')
+          && str(d.summary, 1, 500)
+          && d.updatedAt == request.time;
+      }
+      function ownsEntry() { return resource.data.ownerUid == request.auth.uid; }
+
+      match /entries/{entryId} {
+        allow read: if isMember();
+        allow create: if isMember() && validEntry()
+          && request.resource.data.ownerUid == request.auth.uid
+          && request.resource.data.ownerEmail == myEmail()
+          && request.resource.data.createdAt == request.time
+          && exists(/databases/$(database)/documents/releases/$(releaseId));
+        allow update: if isMember() && (ownsEntry() || isAdmin()) && validEntry()
+          && unchanged('ownerUid') && unchanged('ownerEmail') && unchanged('createdAt');
+        allow delete: if isMember() && (ownsEntry() || isAdmin());
+      }
+    }
+
+    // Board view counts entries across all releases with one collection-group query.
+    match /{path=**}/entries/{entryId} {
+      allow read: if isMember();
+    }
+  }
+}
