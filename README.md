@@ -4,7 +4,7 @@ A small internal page for production releases. Each release shows its version, s
 
 - **Hosting:** GitHub Pages (static Vite build, deployed by `.github/workflows/pages.yml` on every push to `main`).
 - **Backend:** Firebase on the free Spark plan: Firebase Auth (Google, and Microsoft for the company Entra tenant), Firestore for releases, PR entries, members and the `.docx` files (stored as chunks of up to 900 KiB, because Cloud Storage would need the paid Blaze plan).
-- **Access:** only Google accounts on the allowlist (`members` collection) can sign in.
+- **Access:** only Google or company Microsoft accounts on the allowlist (`members` collection) can sign in.
   - **admin:** creates, edits and deletes releases, uploads or replaces release notes, manages members, can fix any PR entry.
   - **dev:** adds PR entries and edits or deletes their own.
 
