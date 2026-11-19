@@ -13,6 +13,7 @@
   "license": "UNLICENSED",
   "description": "Production release board: PR links and release notes per release",
   "dependencies": {
+    "@azure/msal-browser": "^5.30.0",
     "firebase": "^13.4.0"
   },
   "devDependencies": {

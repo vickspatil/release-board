@@ -1,4 +1,6 @@
 import './style.css';
+import { azureToken } from './azure-auth.js';
+import { azureProject, fetchMyPullRequests } from './azure-devops.js';
 import { auth, db, googleProvider, microsoftProvider, usingEmulators } from './firebase.js';
 import { GoogleAuthProvider, OAuthProvider, onAuthStateChanged, signInWithCredential, signInWithPopup, signOut } from 'firebase/auth';
 import {
@@ -37,6 +39,58 @@ const state = {
   busy: '',
   flash: null, // { kind: 'error'|'ok', text }
 };
+
+let azure = { status: 'disconnected', prs: [], account: '', error: '' };
+let azureRequest;
+let azureGeneration = 0;
+
+function resetAzure() {
+  azureGeneration++;
+  azureRequest?.abort();
+  azure = { status: 'disconnected', prs: [], account: '', error: '' };
+}
+
+async function loadAzurePrs(interactive = false) {
+  if (!state.user || !state.member || usingEmulators || azure.status === 'loading') return;
+  const user = state.user;
+  const generation = azureGeneration;
+  azureRequest = new AbortController();
+  const signal = azureRequest.signal;
+  azure = { status: 'loading', prs: [], account: '', error: '' };
+  render();
+  try {
+    const token = await azureToken(user, interactive);
+    if (generation !== azureGeneration || signal.aborted) return;
+    if (!token) {
+      azure.status = 'disconnected';
+    } else {
+      const result = await fetchMyPullRequests(token, { signal });
+      if (generation !== azureGeneration || signal.aborted) return;
+      azure = { ...result, status: 'ready', error: '' };
+    }
+  } catch (e) {
+    if (generation !== azureGeneration || signal.aborted) return;
+    azure = { status: 'error', prs: [], account: '', error: e.message || 'Could not connect to Azure DevOps.' };
+  }
+  render();
+}
+
+function azurePanel(picker = false) {
+  const loading = azure.status === 'loading';
+  return `<div class="azure-prs">
+    <b>My Azure DevOps PRs</b>
+    <p class="muted">${esc(azureProject.project)} · all repositories</p>
+    ${usingEmulators ? '<p class="muted">Azure DevOps is unavailable for local test accounts. Enter a PR manually.</p>' : `
+      ${azure.account ? `<p>Connected as ${esc(azure.account)}</p>` : ''}
+      ${azure.error ? `<p role="alert">${esc(azure.error)}</p>` : ''}
+      ${loading ? '<p role="status">Loading your PRs…</p>' : ''}
+      ${azure.status === 'disconnected' ? '<p class="muted">Connect your work Microsoft account to choose your PRs.</p>' : ''}
+      <button type="button" class="ghost" data-act="azure-connect" ${loading ? 'disabled' : ''}>${azure.status === 'ready' ? 'Refresh PRs' : 'Connect Azure DevOps'}</button>
+      ${azure.status === 'ready' && !azure.prs.length ? '<p>No PRs found for your connected account in this project.</p>' : ''}
+      ${picker && azure.prs.length ? `<label>Choose a PR<select id="azure-pr-picker" data-act="azure-select"><option value="">Select a PR to fill the form</option>${azure.prs.map((pr) => `<option value="${esc(pr.key)}">${esc(pr.repository)} · #${pr.id} · ${esc(pr.title)} (${esc(pr.status)})</option>`).join('')}</select></label>` : ''}
+    `}
+  </div>`;
+}
 
 let listeners = [];
 const stopListeners = () => {
@@ -121,6 +175,7 @@ window.addEventListener('hashchange', () => {
 // ---------- auth & data ------------------------------------------------------
 onAuthStateChanged(auth, (user) => {
   stopListeners();
+  resetAzure();
   state.user = user;
   state.member = null;
   state.releases = [];
@@ -140,9 +195,13 @@ onAuthStateChanged(auth, (user) => {
       (snap) => {
         const wasMember = !!state.member;
         state.member = snap.exists() ? snap.data() : null;
-        if (state.member && !wasMember) startData();
+        if (state.member && !wasMember) {
+          startData();
+          loadAzurePrs();
+        }
         if (!state.member) {
           // Removed from the allowlist (or never on it): drop data listeners.
+          resetAzure();
           listeners.splice(1).forEach((u) => u());
           state.phase = 'not-allowed';
         } else {
@@ -151,6 +210,7 @@ onAuthStateChanged(auth, (user) => {
         render();
       },
       () => {
+        resetAzure();
         state.phase = 'not-allowed';
         render();
       },
@@ -478,6 +538,7 @@ function boardView() {
   return `
     <section class="page">
       <div class="page-head"><h1>Production releases</h1><p>${releases.length} release${releases.length === 1 ? '' : 's'}. Open one to add your PRs.</p></div>
+      ${azurePanel()}
       <div class="grid">${newForm}${cards}</div>
       ${!releases.length && !isAdmin() ? '<p class="empty">No releases yet. An admin creates them.</p>' : ''}
     </section>`;
@@ -486,6 +547,7 @@ function boardView() {
 function entryForm(kind, e = {}) {
   return `
     <form class="entry-form" data-form="${kind}" ${e.id ? `data-id="${esc(e.id)}"` : ''}>
+      ${kind === 'add-entry' ? azurePanel(true) : ''}
       <div class="row">
         <label>Developer<input name="devName" id="${kind}-devName-${esc(e.id || 'new')}" maxlength="80" required value="${esc(e.devName ?? defaultDevName())}" /></label>
         <label class="grow">PR link<input name="prUrl" id="${kind}-prUrl-${esc(e.id || 'new')}" type="url" maxlength="500" required placeholder="https://dev.azure.com/…/pullrequest/12345" value="${esc(e.prUrl || '')}" /></label>
@@ -686,7 +748,11 @@ app.addEventListener('click', (ev) => {
     case 'sign-in-ms':
       signInWithPopup(auth, microsoftProvider).catch((e) => flash('error', friendlyError(e)));
       break;
+    case 'azure-connect':
+      loadAzurePrs(true);
+      break;
     case 'sign-out':
+      resetAzure();
       signOut(auth);
       location.hash = '#/';
       break;
@@ -726,6 +792,14 @@ app.addEventListener('click', (ev) => {
 
 app.addEventListener('change', (ev) => {
   const el = ev.target;
+  if (el.dataset.act === 'azure-select') {
+    const pr = azure.prs.find((p) => p.key === el.value);
+    const form = el.closest('form');
+    if (pr && form) {
+      form.elements.prUrl.value = pr.url;
+      form.elements.summary.value = pr.title.slice(0, 500);
+    }
+  }
   if (el.dataset.act === 'upload') uploadNotes(currentRelease(), el.files?.[0]);
   if (el.dataset.act === 'role') setRole(el.dataset.email, el.value);
 });
