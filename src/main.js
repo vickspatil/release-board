@@ -560,6 +560,24 @@ function entryForm(kind, e = {}) {
     </form>`;
 }
 
+// Groups entries by developer name, ignoring case and extra spaces. Groups are
+// sorted by name; entries keep their incoming (oldest-first) order. The heading
+// uses the most common spelling of the name within the group.
+function groupByDeveloper(entries) {
+  const byKey = new Map();
+  for (const e of entries) {
+    const name = String(e.devName || '').trim().replace(/\s+/g, ' ') || 'Unnamed';
+    const key = name.toLowerCase();
+    if (!byKey.has(key)) byKey.set(key, { entries: [], spellings: new Map() });
+    const g = byKey.get(key);
+    g.entries.push(e);
+    g.spellings.set(name, (g.spellings.get(name) || 0) + 1);
+  }
+  return [...byKey.values()]
+    .map((g) => ({ name: [...g.spellings].sort((a, b) => b[1] - a[1])[0][0], entries: g.entries }))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+}
+
 function releaseView(id) {
   const r = state.releases.find((x) => x.id === id);
   if (!r) {
@@ -595,20 +613,30 @@ function releaseView(id) {
       </div>`
     : '';
 
-  const rows = entries
-    .map((e) => {
-      if (state.editingEntryId === e.id) return `<li class="entry editing">${entryForm('edit-entry', e)}</li>`;
-      const canEdit = admin || e.ownerUid === uid;
-      return `
+  const entryRow = (e) => {
+    if (state.editingEntryId === e.id) return `<li class="entry editing">${entryForm('edit-entry', e)}</li>`;
+    const canEdit = admin || e.ownerUid === uid;
+    return `
       <li class="entry">
         <div class="entry-main">
-          <div class="entry-head"><b>${esc(e.devName)}</b><a href="${esc(safeUrl(e.prUrl))}" target="_blank" rel="noopener noreferrer">${esc(prLabel(e.prUrl))} ↗</a></div>
+          <div class="entry-head"><a href="${esc(safeUrl(e.prUrl))}" target="_blank" rel="noopener noreferrer">${esc(prLabel(e.prUrl))} ↗</a></div>
           <p>${esc(e.summary)}</p>
           <small class="muted">${esc(e.ownerEmail)} · ${esc(fmtTs(e.updatedAt) || 'just now')}</small>
         </div>
         ${canEdit ? `<div class="entry-actions"><button class="link" data-act="edit-entry" data-id="${esc(e.id)}">Edit</button><button class="link danger" data-act="delete-entry" data-id="${esc(e.id)}">Delete</button></div>` : ''}
       </li>`;
-    })
+  };
+  // Display only: group by the developer name on each entry (case and spacing
+  // ignored); the stored entries are unchanged.
+  const groups = groupByDeveloper(entries);
+  const rows = groups
+    .map(
+      (g) => `
+      <li class="dev-group">
+        <div class="dev-head"><b>${esc(g.name)}</b><span class="count">${g.entries.length}</span></div>
+        <ul class="entries">${g.entries.map(entryRow).join('')}</ul>
+      </li>`,
+    )
     .join('');
 
   return `
@@ -617,8 +645,8 @@ function releaseView(id) {
       <div class="release-head"><h1>${esc(r.version)}</h1>${meta}</div>
       <div class="detail-grid">
         <div class="card">
-          <h3>PRs in this release <span class="count">${entries.length}</span></h3>
-          ${entries.length ? `<ul class="entries">${rows}</ul>` : '<p class="muted">No PRs yet. Add yours below.</p>'}
+          <h3>PRs in this release <span class="count">${entries.length}</span>${groups.length > 1 ? `<span class="muted dev-total">from ${groups.length} developers</span>` : ''}</h3>
+          ${entries.length ? `<ul class="dev-groups">${rows}</ul>` : '<p class="muted">No PRs yet. Add yours below.</p>'}
           <h3 class="add-title">Add your PR</h3>
           ${entryForm('add-entry')}
         </div>

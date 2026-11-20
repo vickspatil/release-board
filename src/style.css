@@ -148,6 +148,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); outline
 .detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
 .count { display: inline-block; min-width: 22px; padding: 0 7px; margin-left: 4px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); font-size: 12px; text-align: center; color: var(--ink-2); }
 .entries { list-style: none; margin: 0 0 8px; padding: 0; }
+.dev-groups { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+.dev-group { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.dev-head { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: 14px; }
+.dev-group .entries { margin: 0; padding: 0 12px; }
+.dev-group .entry:first-child { padding-top: 12px; }
+.dev-total { font-size: 12.5px; font-weight: 500; margin-left: 8px; }
 .entry { display: flex; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
 .entry:first-child { border-top: 0; padding-top: 0; }
 .entry.editing { display: block; }
